@@ -1,90 +1,98 @@
+// server.js (Secure Version)
+require('dotenv').config();
 const express = require('express');
-const sqlite3 = require('sqlite3').verbose();
 const bodyParser = require('body-parser');
-const path = require('path');
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
 
 const app = express();
-const port = 3000;
-
-// Middleware
-app.use(bodyParser.urlencoded({ extended: true }));
 app.use(bodyParser.json());
-app.use(express.static('public'));
 
-// Initialize SQLite database
-const db = new sqlite3.Database(':memory:');
+// In-memory user store (replace with real DB in production)
+const users = [];
 
-// Create users table and insert sample data
-db.serialize(() => {
-    db.run(`CREATE TABLE users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        username TEXT,
-        password TEXT
-    )`);
-    
-    // Insert sample users
-    db.run("INSERT INTO users (username, password) VALUES ('admin', 'secretpassword')");
-    db.run("INSERT INTO users (username, password) VALUES ('user1', 'password123')");
-    db.run("INSERT INTO users (username, password) VALUES ('testuser', 'mypassword')");
+// Utility: generate JWT for authenticated users
+function generateToken(user) {
+  return jwt.sign(
+    { username: user.username, role: user.role },
+    process.env.JWT_SECRET,
+    { expiresIn: '1h' }
+  );
+}
+
+// Middleware: verify JWT and attach user to request
+function authenticateToken(req, res, next) {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+  if (!token) return res.status(401).json({ message: 'Token missing' });
+  jwt.verify(token, process.env.JWT_SECRET, (err, payload) => {
+    if (err) return res.status(403).json({ message: 'Token invalid or expired' });
+    req.user = payload;  // { username, role }
+    next();
+  });
+}
+
+// Middleware: enforce role-based authorization
+function authorizeRole(requiredRole) {
+  return (req, res, next) => {
+    if (req.user.role !== requiredRole) {
+      return res.status(403).json({ message: 'Insufficient privileges' });
+    }
+    next();
+  };
+}
+
+// Registration endpoint
+app.post('/register', async (req, res) => {
+  const { username, password, role } = req.body;
+  if (!username || !password) {
+    return res.status(400).json({ message: 'Username and password are required' });
+  }
+  // Check if user already exists
+  if (users.find(u => u.username === username)) {
+    return res.status(409).json({ message: 'User already exists' });
+  }
+  // Hash the password
+  const hashedPassword = await bcrypt.hash(password, 10);
+  users.push({ username, password: hashedPassword, role: role || 'user' });
+  res.status(201).json({ message: 'User registered successfully' });
 });
 
-// Serve the login page
-app.get('/', (req, res) => {
-    res.sendFile(path.join(__dirname, 'public', 'index.html'));
+// Login endpoint
+app.post('/login', async (req, res) => {
+  const { username, password } = req.body;
+  if (!username || !password) {
+    return res.status(400).json({ message: 'Username and password are required' });
+  }
+  const user = users.find(u => u.username === username);
+  if (!user) {
+    return res.status(401).json({ message: 'Invalid credentials' });
+  }
+  // Compare hashed password
+  const match = await bcrypt.compare(password, user.password);
+  if (!match) {
+    return res.status(401).json({ message: 'Invalid credentials' });
+  }
+  // Generate and return JWT
+  const token = generateToken(user);
+  res.json({ token });
 });
 
-// VULNERABLE LOGIN ENDPOINT - DO NOT USE IN PRODUCTION!
-app.post('/login', (req, res) => {
-    const { username, password } = req.body;
-    
-    // VULNERABLE SQL QUERY - Directly interpolating user input!
-    const query = `SELECT * FROM users WHERE username = '${username}' AND password = '${password}'`;
-    
-    console.log('Executing query:', query); // For demonstration purposes
-    
-    db.get(query, (err, row) => {
-        if (err) {
-            console.error('Database error:', err);
-            res.status(500).json({ 
-                success: false, 
-                message: 'Database error occurred',
-                error: err.message 
-            });
-            return;
-        }
-        
-        if (row) {
-            res.json({ 
-                success: true, 
-                message: 'Login successful!', 
-                user: { id: row.id, username: row.username }
-            });
-        } else {
-            res.json({ 
-                success: false, 
-                message: 'Invalid credentials' 
-            });
-        }
-    });
+// Example of a protected route accessible to any authenticated user
+app.get('/profile', authenticateToken, (req, res) => {
+  res.json({ message: `Hello, ${req.user.username}`, role: req.user.role });
 });
 
-// Get all users (for demonstration)
-app.get('/users', (req, res) => {
-    db.all("SELECT id, username FROM users", (err, rows) => {
-        if (err) {
-            res.status(500).json({ error: err.message });
-            return;
-        }
-        res.json(rows);
-    });
+// Example of an admin-only endpoint
+app.delete('/admin/user/:username', authenticateToken, authorizeRole('admin'), (req, res) => {
+  const target = users.findIndex(u => u.username === req.params.username);
+  if (target < 0) return res.status(404).json({ message: 'User not found' });
+  users.splice(target, 1);
+  res.json({ message: 'User deleted' });
 });
 
-app.listen(port, () => {
-    console.log(`Vulnerable login demo running at http://localhost:${port}`);
-    console.log('');
-    console.log('🚨 WARNING: This application is intentionally vulnerable!');
-    console.log('For educational purposes only - DO NOT use in production!');
-    console.log('');
-    console.log('Try SQL injection with: \' OR 1=1--');
-    console.log('Or try: admin\' OR \'1\'=\'1\' --');
+// Start server
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
 });
