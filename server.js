@@ -1,90 +1,89 @@
+// server.js
+require('dotenv').config();
 const express = require('express');
-const sqlite3 = require('sqlite3').verbose();
 const bodyParser = require('body-parser');
-const path = require('path');
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
+const cookieParser = require('cookie-parser');
 
 const app = express();
-const port = 3000;
-
-// Middleware
-app.use(bodyParser.urlencoded({ extended: true }));
 app.use(bodyParser.json());
-app.use(express.static('public'));
+app.use(cookieParser());
 
-// Initialize SQLite database
-const db = new sqlite3.Database(':memory:');
+// Load secrets from environment
+const JWT_SECRET = process.env.JWT_SECRET;
+const ADMIN_USERNAME = process.env.ADMIN_USERNAME;
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
 
-// Create users table and insert sample data
-db.serialize(() => {
-    db.run(`CREATE TABLE users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        username TEXT,
-        password TEXT
-    )`);
-    
-    // Insert sample users
-    db.run("INSERT INTO users (username, password) VALUES ('admin', 'secretpassword')");
-    db.run("INSERT INTO users (username, password) VALUES ('user1', 'password123')");
-    db.run("INSERT INTO users (username, password) VALUES ('testuser', 'mypassword')");
+if (!JWT_SECRET || !ADMIN_USERNAME || !ADMIN_PASSWORD) {
+  console.error('Missing required environment variables. Please set JWT_SECRET, ADMIN_USERNAME, ADMIN_PASSWORD.');
+  process.exit(1);
+}
+
+// Pre-hash the admin password on startup
+const users = [
+  {
+    username: ADMIN_USERNAME,
+    passwordHash: bcrypt.hashSync(ADMIN_PASSWORD, 10)
+  }
+];
+
+app.post('/login', async (req, res) => {
+  const { username, password } = req.body;
+  // Input validation
+  if (typeof username !== 'string' || typeof password !== 'string') {
+    return res.status(400).json({ error: 'Username and password must be strings.' });
+  }
+
+  // Find user by username
+  const user = users.find(u => u.username === username);
+  if (!user) {
+    return res.status(401).json({ error: 'Invalid credentials.' });
+  }
+
+  // Compare hashed password
+  const isValid = await bcrypt.compare(password, user.passwordHash);
+  if (!isValid) {
+    return res.status(401).json({ error: 'Invalid credentials.' });
+  }
+
+  // Issue JSON Web Token
+  const token = jwt.sign(
+    { username: user.username },
+    JWT_SECRET,
+    { expiresIn: '1h' }
+  );
+
+  // Set secure HTTP-only cookie
+  res.cookie('auth_token', token, {
+    httpOnly: true,
+    secure: true,         // ensure HTTPS
+    sameSite: 'Strict',
+    maxAge: 60 * 60 * 1000 // 1 hour
+  });
+
+  return res.json({ message: 'Logged in successfully.' });
 });
 
-// Serve the login page
-app.get('/', (req, res) => {
-    res.sendFile(path.join(__dirname, 'public', 'index.html'));
+app.post('/logout', (req, res) => {
+  // Clear the authentication cookie
+  res.clearCookie('auth_token');
+  return res.json({ message: 'Logged out successfully.' });
 });
 
-// VULNERABLE LOGIN ENDPOINT - DO NOT USE IN PRODUCTION!
-app.post('/login', (req, res) => {
-    const { username, password } = req.body;
-    
-    // VULNERABLE SQL QUERY - Directly interpolating user input!
-    const query = `SELECT * FROM users WHERE username = '${username}' AND password = '${password}'`;
-    
-    console.log('Executing query:', query); // For demonstration purposes
-    
-    db.get(query, (err, row) => {
-        if (err) {
-            console.error('Database error:', err);
-            res.status(500).json({ 
-                success: false, 
-                message: 'Database error occurred',
-                error: err.message 
-            });
-            return;
-        }
-        
-        if (row) {
-            res.json({ 
-                success: true, 
-                message: 'Login successful!', 
-                user: { id: row.id, username: row.username }
-            });
-        } else {
-            res.json({ 
-                success: false, 
-                message: 'Invalid credentials' 
-            });
-        }
-    });
+// Example protected route
+app.get('/profile', (req, res) => {
+  const token = req.cookies.auth_token;
+  if (!token) {
+    return res.status(401).json({ error: 'Authentication required.' });
+  }
+  try {
+    const payload = jwt.verify(token, JWT_SECRET);
+    return res.json({ username: payload.username });
+  } catch (err) {
+    return res.status(401).json({ error: 'Invalid or expired token.' });
+  }
 });
 
-// Get all users (for demonstration)
-app.get('/users', (req, res) => {
-    db.all("SELECT id, username FROM users", (err, rows) => {
-        if (err) {
-            res.status(500).json({ error: err.message });
-            return;
-        }
-        res.json(rows);
-    });
-});
-
-app.listen(port, () => {
-    console.log(`Vulnerable login demo running at http://localhost:${port}`);
-    console.log('');
-    console.log('🚨 WARNING: This application is intentionally vulnerable!');
-    console.log('For educational purposes only - DO NOT use in production!');
-    console.log('');
-    console.log('Try SQL injection with: \' OR 1=1--');
-    console.log('Or try: admin\' OR \'1\'=\'1\' --');
-});
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
